@@ -1,0 +1,7 @@
+[project]
+name = "movie-ascii"
+version = "0.1.0"
+dependencies = ["opencv-python", "yt-dlp", "youtube-transcript-api", "ffpyplayer"]
+
+[project.scripts]
+movie-ascii = "movie_ascii.main:main"

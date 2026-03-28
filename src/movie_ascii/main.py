@@ -4,10 +4,15 @@ import sys
 import base64
 import webbrowser
 import time
+import subprocess
+import tempfile
+import shutil
 from urllib.parse import urlparse, parse_qs
 import select
 import tty
 import termios
+import threading
+import queue as _queue
 
 if os.name != "nt":
     # Save the original physical error pipe
@@ -18,7 +23,20 @@ if os.name != "nt":
     os.dup2(devnull_fd, sys.stderr.fileno())
 
 import cv2
+import numpy as np
 import yt_dlp
+try:
+    from PIL import Image as _PILImage, ImageDraw as _PILDraw, ImageFont as _PILFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+    _PILImage = _PILDraw = _PILFont = None
+
+try:
+    import imageio_ffmpeg as _iio_ffmpeg
+    _FFMPEG_EXE = _iio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    _FFMPEG_EXE = "ffmpeg"  # fall back to system ffmpeg if package unavailable
 from youtube_transcript_api import YouTubeTranscriptApi
 from ffpyplayer.player import MediaPlayer
 from ffpyplayer.tools import set_loglevel
@@ -41,40 +59,454 @@ CHARSETS = {
     "blocks": " ░▒▓█"
 }
 
+# Pre-computed lookup table for ascii-color mode (avoids per-pixel f-string in hot path)
+_ANSI_COLOR_TABLES = {
+    charset_name: {
+        (ai, ci): f"\033[{30 + ai}m{ch}\033[0m"
+        for ai in range(8)
+        for ci, ch in enumerate(chars)
+    }
+    for charset_name, chars in CHARSETS.items()
+}
+
+
+# ---------------------------------------------------------------------------
+# PIL-based rendering helpers (used for --save export)
+# ---------------------------------------------------------------------------
+
+def _init_ascii_renderer(charset_name):
+    """Build (glyph_atlas, char_w, char_h) bitmap atlas for PIL-based export."""
+    if not _PIL_AVAILABLE:
+        raise RuntimeError("Pillow is required for export. Run: pip install pillow")
+    chars = CHARSETS[charset_name]
+    try:
+        font = _PILFont.load_default(size=12)
+    except TypeError:
+        font = _PILFont.load_default()
+    try:
+        bb = font.getbbox("M")
+        cw = max(bb[2] - bb[0], 1) + 2
+        ch_font = max(bb[3] - bb[1], 1) + 3
+    except Exception:
+        cw, ch_font = 8, 14
+    # Force ch = 2*cw so the aspect ratio of the exported image matches the
+    # terminal view. resize_image already halves the row count (the *0.5 factor)
+    # to compensate for terminal chars being ~2x taller than wide. The glyph
+    # cell must honour the same 2:1 ratio or the output will be squished.
+    ch = 2 * cw
+    atlas = np.zeros((len(chars), ch, cw), dtype=bool)
+    for ci, char in enumerate(chars):
+        # Render glyph at its natural font height, then center it in the taller cell
+        tmp = _PILImage.new("L", (cw, ch_font), 0)
+        d = _PILDraw.Draw(tmp)
+        try:
+            bb = font.getbbox(char)
+            ox = max((cw - (bb[2] - bb[0])) // 2, 0) - bb[0]
+            oy = max((ch_font - (bb[3] - bb[1])) // 2, 0) - bb[1]
+        except Exception:
+            ox, oy = 0, 0
+        d.text((ox, oy), char, fill=255, font=font)
+        glyph = np.array(tmp) > 64
+        y_off = (ch - ch_font) // 2
+        y_end = min(y_off + ch_font, ch)
+        atlas[ci, y_off:y_end, :] = glyph[:y_end - y_off, :]
+    return atlas, cw, ch
+
+
+def _render_frame_to_pil(resized_bgr, mode, charset_name, glyph_atlas, cw, ch, color_bits=5):
+    """Vectorized BGR frame → PIL Image for file export."""
+    _ANSI_PAL = np.array([
+        (85, 85, 85), (255, 85, 85), (85, 255, 85), (255, 255, 85),
+        (85, 85, 255), (255, 85, 255), (85, 255, 255), (255, 255, 255),
+    ], dtype=np.uint8)
+    quant_mask = 0xFF & ~((1 << (8 - color_bits)) - 1)
+    image_rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+    chars = CHARSETS[charset_name]
+    H, W = image_rgb.shape[:2]
+    lum = (0.299 * image_rgb[:, :, 0].astype(np.float32)
+           + 0.587 * image_rgb[:, :, 1].astype(np.float32)
+           + 0.114 * image_rgb[:, :, 2].astype(np.float32))
+    idx = np.clip((lum * ((len(chars) - 1) / 255.0)).astype(np.int32), 0, len(chars) - 1)
+    if mode == "bw":
+        colors = np.full((H, W, 3), 220, dtype=np.uint8)
+    elif mode == "ascii-color":
+        ai = ((image_rgb[:, :, 0] > 127).astype(np.int32)
+              + (image_rgb[:, :, 1] > 127).astype(np.int32) * 2
+              + (image_rgb[:, :, 2] > 127).astype(np.int32) * 4)
+        colors = _ANSI_PAL[ai]
+    else:
+        colors = (image_rgb & quant_mask).astype(np.uint8)
+    # Glyph atlas lookup: (H, W, ch, cw) → transpose → (H*ch, W*cw) bool mask
+    glyph_mask = np.ascontiguousarray(
+        glyph_atlas[idx].transpose(0, 2, 1, 3)
+    ).reshape(H * ch, W * cw)
+    # Colors expansion: (H, W, 3) → (H, ch, W, cw, 3) → (H*ch, W*cw, 3)
+    c_exp = np.ascontiguousarray(
+        np.broadcast_to(
+            colors[:, :, np.newaxis, np.newaxis, :], (H, W, ch, cw, 3)
+        ).transpose(0, 2, 1, 3, 4)
+    ).reshape(H * ch, W * cw, 3)
+    canvas = np.zeros((H * ch, W * cw, 3), dtype=np.uint8)
+    canvas[glyph_mask] = c_exp[glyph_mask]
+    return _PILImage.fromarray(canvas)
+
+
+def export_to_file(source_path, width, mode, charset_name, output_path, gif_frames=None, color_bits=5):
+    """Export ASCII art to output_path.
+    Supported extensions: .gif  .mp4  .png  .jpg  .html
+    gif_frames: list of (bgr_array, duration_s) when source is an animated GIF.
+    """
+    if not _PIL_AVAILABLE:
+        print("Error: Pillow required for export. Install with: pip install pillow")
+        return
+    ext = os.path.splitext(output_path)[1].lower()
+    if ext not in {".gif", ".mp4", ".png", ".jpg", ".jpeg", ".html"}:
+        print(f"Unsupported format '{ext}'. Supported: .gif .mp4 .png .jpg .html")
+        return
+
+    atlas, cw, ch = _init_ascii_renderer(charset_name)
+
+    # Detect static image sources (cv2.VideoCapture can't decode them)
+    _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
+    _is_image = (
+        gif_frames is None
+        and source_path
+        and os.path.splitext(source_path)[1].lower() in _IMAGE_EXTS
+    )
+
+    # Resolve frame source
+    cap = None
+    raw_frames = None
+    fps_out = 25.0
+    dur_ms_list = [100]
+    total = 1
+
+    if gif_frames is not None:
+        raw_frames = [f[0] for f in gif_frames]
+        dur_ms_list = [max(int(f[1] * 1000), 20) for f in gif_frames]
+        fps_out = 1000.0 / dur_ms_list[0] if dur_ms_list else 10.0
+        total = len(raw_frames)
+    elif _is_image:
+        bgr = cv2.imread(source_path)
+        if bgr is None:
+            print(f"Error: Could not read image '{source_path}'.")
+            return
+        raw_frames = [bgr]
+        dur_ms_list = [100]
+        total = 1
+    else:
+        cap = cv2.VideoCapture(source_path)
+        if not cap.isOpened():
+            print(f"Error: Could not open '{source_path}'.")
+            return
+        fps_out = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        dur_ms_list = [int(1000 / fps_out)]
+
+    print(f"Exporting {total if total > 0 else '?'} frame(s) -> '{output_path}'")
+
+    def _next_frame():
+        """Yield BGR frames from either raw_frames list or cap."""
+        if raw_frames is not None:
+            yield from raw_frames
+        else:
+            while True:
+                ret, bgr = cap.read()
+                if not ret:
+                    break
+                yield bgr
+
+    def _dur(i):
+        return dur_ms_list[i] if i < len(dur_ms_list) else dur_ms_list[0]
+
+    # PNG / JPG: single first frame
+    if ext in {".png", ".jpg", ".jpeg"}:
+        bgr = next(_next_frame())
+        _render_frame_to_pil(resize_image(bgr, width), mode, charset_name, atlas, cw, ch, color_bits).save(output_path)
+        if cap:
+            cap.release()
+        print(f"Saved: {output_path}")
+        return
+
+    # HTML: JS-animated HTML, one <div> per frame
+    if ext == ".html":
+        if total > 150:
+            print(f"  Warning: {total} frames may produce a large HTML file. Consider .mp4.")
+        frames_html, delays = [], []
+        for i, bgr in enumerate(_next_frame()):
+            frames_html.append(pixels_to_html(resize_image(bgr, width), mode, charset_name))
+            delays.append(_dur(i))
+            if (i + 1) % 25 == 0:
+                print(f"  {i + 1}/{total}...", end="\r", flush=True)
+        if cap:
+            cap.release()
+        frame_divs = "".join(f'<div class="frame">{f}</div>' for f in frames_html)
+        html = (
+            '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>'
+            'body{background:#0c0c0c;margin:0;display:flex;justify-content:center;}'
+            '.frame{display:none;white-space:nowrap;font-family:monospace;font-size:8px;line-height:9px;letter-spacing:0;}'
+            '.active{display:block;}'
+            f'</style></head><body><div id="v">{frame_divs}</div><script>'
+            'const f=document.querySelectorAll(".frame");'
+            f'const d={delays};'
+            'let i=0;function n(){f[i].classList.remove("active");i=(i+1)%f.length;'
+            'f[i].classList.add("active");setTimeout(n,d[i]||100);}'
+            'if(f.length){f[0].classList.add("active");setTimeout(n,d[0]||100);}'
+            '</script></body></html>'
+        )
+        print(f"\nSaving HTML...")
+        with open(output_path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        print(f"Saved: {output_path}")
+        return
+
+    # GIF: load all frames into memory then save
+    if ext == ".gif":
+        if total > 200:
+            print(f"  Warning: {total} frames may produce a very large GIF. Consider .mp4.")
+        pil_frames, frame_durations = [], []
+        for i, bgr in enumerate(_next_frame()):
+            pil_frames.append(
+                _render_frame_to_pil(resize_image(bgr, width), mode, charset_name, atlas, cw, ch, color_bits)
+            )
+            frame_durations.append(_dur(i))
+            if (i + 1) % 25 == 0:
+                print(f"  {i + 1}/{total} frames...", end="\r", flush=True)
+        if cap:
+            cap.release()
+        if pil_frames:
+            print(f"\nSaving GIF...")
+            pil_frames[0].save(
+                output_path, save_all=True, append_images=pil_frames[1:],
+                duration=frame_durations, loop=0, optimize=False,
+            )
+        print(f"Saved: {output_path}")
+        return
+
+    # MP4: streaming render (avoids loading all frames into RAM)
+    # Audio is muxed in afterwards via ffmpeg (if available)
+    if ext == ".mp4":
+        # Write silent video to a temp file first so we can mux audio after
+        tmp_fd, tmp_silent = tempfile.mkstemp(suffix="_silent.mp4")
+        os.close(tmp_fd)
+        vw = None
+        for i, bgr in enumerate(_next_frame()):
+            pil_frame = _render_frame_to_pil(resize_image(bgr, width), mode, charset_name, atlas, cw, ch, color_bits)
+            if vw is None:
+                out_w, out_h = pil_frame.size
+                vw = cv2.VideoWriter(
+                    tmp_silent, cv2.VideoWriter_fourcc(*"mp4v"), fps_out, (out_w, out_h)
+                )
+            vw.write(cv2.cvtColor(np.array(pil_frame), cv2.COLOR_RGB2BGR))
+            if (i + 1) % 50 == 0:
+                print(f"  {i + 1}/{total if total > 0 else '?'} frames...", end="\r", flush=True)
+        if cap:
+            cap.release()
+        if vw:
+            vw.release()
+        print()
+        # Try to mux the original audio track using the bundled ffmpeg binary
+        audio_added = False
+        if gif_frames is None and not _is_image and source_path:
+            try:
+                subprocess.run(
+                    [
+                        _FFMPEG_EXE, "-y",
+                        "-i", tmp_silent,
+                        "-i", source_path,
+                        "-c:v", "copy",
+                        "-c:a", "aac", "-b:a", "192k",
+                        "-map", "0:v:0", "-map", "1:a:0",
+                        "-shortest",
+                        output_path,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=600,
+                )
+                audio_added = True
+                print("Audio track added.")
+            except FileNotFoundError:
+                print("ffmpeg binary not found — saving without audio.")
+            except subprocess.CalledProcessError:
+                print("Could not add audio (source may have no audio track) — saving without audio.")
+            except subprocess.TimeoutExpired:
+                print("ffmpeg timed out — saving without audio.")
+        if audio_added:
+            os.remove(tmp_silent)
+        else:
+            os.replace(tmp_silent, output_path)
+        print(f"Saved: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# CLI utility commands
+# ---------------------------------------------------------------------------
+
+def cmd_list_charsets():
+    """Print all built-in charsets with a gradient preview bar."""
+    print("\n\033[1mAvailable charsets\033[0m  (use with -c NAME or -c \"custom chars\")\n")
+    for name, chars in CHARSETS.items():
+        n = len(chars)
+        # Build a short gradient bar sampling evenly across the charset
+        bar_len = 40
+        bar = "".join(chars[int(i * (n - 1) / (bar_len - 1))] for i in range(bar_len))
+        print(f"  \033[33m{name:<14}\033[0m ({n:>3} chars)  {bar}")
+    print()
+    print("  \033[2mTip: pass any string directly to create a custom charset\033[0m")
+    print("  \033[2mExample: -c \" .:░▒▓█\"\033[0m\n")
+
+
+def cmd_wizard():
+    """Interactive resolution picker based on current terminal size."""
+    try:
+        term = shutil.get_terminal_size(fallback=(80, 24))
+    except Exception:
+        term = os.terminal_size((80, 24))
+    cols, rows = term.columns, term.lines
+
+    print(f"\n\033[1mTerminal size detected:\033[0m {cols} × {rows}\n")
+    print(f"{'Width':>8}  {'Chars (w×h)':^14}  {'bw MB/s':>9}  {'color MB/s':>11}  {'truecol MB/s':>13}  Bar")
+    print("  " + "─" * 72)
+
+    widths = []
+    for frac, label in [(1.0, "Full"), (0.75, "3/4"), (0.5, "Half"), (0.33, "1/3"), (0.25, "1/4")]:
+        w = max(10, int(cols * frac))
+        if widths and widths[-1][0] == w:
+            continue
+        widths.append((w, label))
+
+    for w, label in widths:
+        h = int(w * 0.5)  # typical aspect ratio after resize
+        total = w * h
+        fps = 25
+        bw_mbs   = total * 1    * fps / 1e6
+        col_mbs  = total * 7    * fps / 1e6   # avg after RLE
+        tru_mbs  = total * 12   * fps / 1e6   # avg at --colors 32
+
+        def grade(mbs):
+            if mbs < 1.5:
+                return "\033[32m✓ safe\033[0m"
+            elif mbs < 3.0:
+                return "\033[33m~ ok\033[0m "
+            else:
+                return "\033[31m✗ slow\033[0m"
+
+        bar_full = int(w / cols * 40)
+        bar = "█" * bar_full + "░" * (40 - bar_full)
+
+        print(
+            f"  {label:<6} {w:>4}  {w:>4}×{h:<4}  "
+            f"{bw_mbs:>6.2f} {grade(bw_mbs):>4}  "
+            f"{col_mbs:>6.2f} {grade(col_mbs):>4}  "
+            f"{tru_mbs:>6.2f} {grade(tru_mbs):>4}  "
+            f"{bar}"
+        )
+
+    print()
+    print("  \033[2mTip: choose a width where all desired modes are within safe range.\033[0m")
+    print(f"  \033[2mExample: movie-ascii myvideo.mp4 -w {int(cols * 0.5)} -m truecolor\033[0m\n")
+
 
 def setup_args():
-    parser = argparse.ArgumentParser(
-        description="Converts images and videos to ASCII art."
+    _epilog = (
+        "Examples:\n"
+        "  movie-ascii clip.mp4                        # play in black & white\n"
+        "  movie-ascii clip.mp4 -m truecolor -w 120    # truecolor, 120 cols wide\n"
+        "  movie-ascii image.jpg --save out.png        # export frame as PNG\n"
+        "  movie-ascii anim.gif -m ascii-color         # animated GIF in terminal\n"
+        "  movie-ascii https://youtu.be/... -m bw      # stream from YouTube\n"
+        "  movie-ascii clip.mp4 -c blocks              # use block charset\n"
+        "  movie-ascii clip.mp4 -c \" .:▒█\"            # custom charset string\n"
+        "  movie-ascii --list-charsets                 # show all charsets\n"
+        "  movie-ascii --wizard                        # pick resolution for your terminal\n"
     )
-    parser.add_argument("filepath", help="Path to the image (e.g. test.jpg)")
-    parser.add_argument(
-        "-w", "--width", type=int, default=100, help="Width in characters"
+
+    parser = argparse.ArgumentParser(
+        prog="movie-ascii",
+        description="Play videos, GIFs and images as ASCII art in your terminal.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_epilog,
     )
 
     parser.add_argument(
-        "-c", "--charset", choices=list(CHARSETS.keys()), default="standard"
+        "filepath",
+        nargs="?",
+        metavar="FILE|URL",
+        help="Path or URL to a video, GIF, or image file.",
+    )
+
+    parser.add_argument(
+        "-w", "--width",
+        type=int,
+        default=None,
+        metavar="COLS",
+        help="Output width in characters (default: 80%% of terminal width).",
+    )
+
+    parser.add_argument(
+        "-m", "--mode",
+        choices=["bw", "ascii-color", "truecolor"],
+        default="bw",
+        metavar="MODE",
+        help="Render mode: bw | ascii-color | truecolor  (default: bw).",
+    )
+
+    parser.add_argument(
+        "-c", "--charset",
+        default="standard",
+        metavar="NAME|CHARS",
+        help=(
+            "Charset to use.  Built-in names: "
+            + ", ".join(CHARSETS.keys())
+            + ".  Or pass any custom string (min 2, max 256 chars)."
+        ),
+    )
+
+    parser.add_argument(
+        "--colors",
+        type=int,
+        default=5,
+        choices=range(3, 9),
+        metavar="BITS",
+        help=(
+            "Color quantization depth for truecolor mode (3–8 bits per channel, "
+            "default 5).  Lower = faster / less data; higher = more detail."
+        ),
+    )
+
+    parser.add_argument(
+        "-l", "--lang",
+        type=str,
+        default="es",
+        metavar="LANG",
+        help="Preferred subtitle language for YouTube videos (e.g. es, en, fr).",
+    )
+
+    parser.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Export to file instead of playing.  Supported: .png .jpg .gif .mp4 .html",
     )
 
     parser.add_argument(
         "--grid",
         action="store_true",
-        help="Generates and opens an HTML comparing all modes",
+        help="Generate an HTML grid comparing all render modes and open it in a browser.",
     )
 
     parser.add_argument(
-        "-m",
-        "--mode",
-        choices=["bw", "ascii-color", "truecolor"],
-        default="bw",
-        help="Mode: 'bw', 'ascii-color' (16 colors), or 'truecolor' (RGB + Alphabet)",
+        "-L", "--list-charsets",
+        action="store_true",
+        help="List all built-in charsets with a preview and exit.",
     )
 
     parser.add_argument(
-        "-l",
-        "--lang",
-        type=str,
-        default="es",
-        help="Preferred language for subtitles (e.g. 'es', 'en', 'fr')",
+        "--wizard",
+        action="store_true",
+        help="Show a resolution guide based on your terminal size and exit.",
     )
 
     return parser.parse_args()
@@ -87,34 +519,81 @@ def resize_image(image, new_width=100):
     return cv2.resize(image, (new_width, new_height))
 
 
-def pixels_to_text(image, mode, charset_name):
-    """Generates text for the terminal (with ANSI codes)."""
-    ascii_str = ""
+def pixels_to_text(image, mode, charset_name, color_bits=5):
+    """Generates text for the terminal (with ANSI codes).
+    color_bits: 3-8, controls truecolor quantization (5=default, lower=more RLE compression).
+    """
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     chars = CHARSETS[charset_name]
+    n_chars = len(chars)
 
-    for row in image_rgb:
-        for pixel in row:
-            r, g, b = pixel
-            
-            luminance = int(0.299 * r + 0.587 * g + 0.114 * b)
-            char_index = int(luminance / 255 * (len(chars) - 1))
-            char = chars[char_index]
+    # Vectorized luminance and char-index computation (avoids per-pixel Python loop)
+    lum = (
+        0.299 * image_rgb[:, :, 0].astype(np.float32)
+        + 0.587 * image_rgb[:, :, 1].astype(np.float32)
+        + 0.114 * image_rgb[:, :, 2].astype(np.float32)
+    )
+    idx = np.clip((lum * ((n_chars - 1) / 255.0)).astype(np.int32), 0, n_chars - 1)
 
-            if mode == "bw":
-                ascii_str += char
-            elif mode == "ascii-color":
-                ansi_index = (
-                    (1 if r > 127 else 0)
-                    + (2 if g > 127 else 0)
-                    + (4 if b > 127 else 0)
-                )
-                ascii_str += f"\033[{30 + ansi_index}m{char}\033[0m"
-            elif mode == "truecolor":
-                ascii_str += f"\033[38;2;{r};{g};{b}m{char}\033[0m"
+    if mode == "bw":
+        char_arr = np.array(list(chars))
+        return "\n".join("".join(char_arr[row].tolist()) for row in idx) + "\n"
 
-        ascii_str += "\n"
-    return ascii_str
+    elif mode == "ascii-color":
+        r, g, b = image_rgb[:, :, 0], image_rgb[:, :, 1], image_rgb[:, :, 2]
+        ansi = (
+            (r > 127).astype(np.int32)
+            + (g > 127).astype(np.int32) * 2
+            + (b > 127).astype(np.int32) * 4
+        )
+        lines = []
+        for ri in range(idx.shape[0]):
+            row_ansi = ansi[ri].tolist()
+            row_idx = idx[ri].tolist()
+            parts = []
+            prev_ai = -1
+            for ci in range(len(row_idx)):
+                ai = row_ansi[ci]
+                ch = chars[row_idx[ci]]
+                if ai != prev_ai:
+                    parts.append(f"\033[{30 + ai}m{ch}")
+                    prev_ai = ai
+                else:
+                    parts.append(ch)
+            parts.append("\033[0m")
+            lines.append("".join(parts))
+        return "\n".join(lines) + "\n"
+
+    else:  # truecolor — RLE with configurable quantization
+        # color_bits controls how many bits per channel are kept.
+        # Lower = larger RLE runs = less data → safer for slow terminals.
+        # 5 bits (mask 0xF8) is the stable default; 8 bits = full precision.
+        quant_mask = 0xFF & ~((1 << (8 - color_bits)) - 1)
+        char_list = list(chars)
+        r_ch = image_rgb[:, :, 0]
+        g_ch = image_rgb[:, :, 1]
+        b_ch = image_rgb[:, :, 2]
+        lines = []
+        for ri in range(idx.shape[0]):
+            r_row = r_ch[ri].tolist()
+            g_row = g_ch[ri].tolist()
+            b_row = b_ch[ri].tolist()
+            idx_row = idx[ri].tolist()
+            parts = []
+            prev_r = prev_g = prev_b = -1
+            for ci in range(len(idx_row)):
+                rv = r_row[ci] & quant_mask
+                gv = g_row[ci] & quant_mask
+                bv = b_row[ci] & quant_mask
+                ch = char_list[idx_row[ci]]
+                if rv != prev_r or gv != prev_g or bv != prev_b:
+                    parts.append(f"\033[38;2;{rv};{gv};{bv}m{ch}")
+                    prev_r, prev_g, prev_b = rv, gv, bv
+                else:
+                    parts.append(ch)
+            parts.append("\033[0m")
+            lines.append("".join(parts))
+        return "\n".join(lines) + "\n"
 
 
 def pixels_to_html(image, mode, charset_name):
@@ -341,7 +820,128 @@ def format_time(seconds):
     return f"{mins:02d}:{secs:02d}"
 
 
-def play_video(filepath, width, mode, charset_name, transcript=None):
+def play_gif(filepath, width, mode, charset_name, color_bits=5):
+    """Plays an animated GIF as ASCII art in the terminal."""
+    try:
+        gif = _PILImage.open(filepath)
+    except Exception as e:
+        print(f"Error: Could not open GIF '{filepath}': {e}")
+        return
+
+    if not hasattr(gif, 'n_frames') or gif.n_frames < 2:
+        # Static image — render a single frame and exit
+        frame_bgr = cv2.cvtColor(np.array(gif.convert('RGB')), cv2.COLOR_RGB2BGR)
+        resized = resize_image(frame_bgr, width)
+        print(pixels_to_text(resized, mode, charset_name, color_bits))
+        return
+
+    # Collect all frames and their durations up front
+    frames = []
+    for i in range(gif.n_frames):
+        gif.seek(i)
+        duration_ms = gif.info.get('duration', 100)  # default 100ms if missing
+        frame_bgr = cv2.cvtColor(np.array(gif.convert('RGB')), cv2.COLOR_RGB2BGR)
+        frames.append((frame_bgr, max(duration_ms, 20) / 1000.0))
+
+    _write_queue = _queue.Queue(maxsize=1)
+    _writer_stop = threading.Event()
+
+    def _writer():
+        CHUNK = 4096
+        frame_time = 0.1
+        while True:
+            try:
+                item = _write_queue.get(timeout=0.05)
+            except _queue.Empty:
+                if _writer_stop.is_set():
+                    break
+                continue
+            if isinstance(item, tuple):
+                data, frame_time = item
+            else:
+                data = item
+            offset = 0
+            while offset < len(data):
+                chunk = data[offset: offset + CHUNK]
+                try:
+                    _, writable, _ = select.select([], [1], [], frame_time)
+                except (OSError, ValueError):
+                    return
+                if not writable:
+                    break
+                try:
+                    written = os.write(1, chunk)
+                    offset += written
+                except OSError:
+                    return
+
+    _writer_thread = threading.Thread(target=_writer, daemon=True)
+    _writer_thread.start()
+
+    os.system("cls" if os.name == "nt" else "clear")
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+
+    old_settings = None
+    if os.name != "nt":
+        old_settings = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+
+    previous_frame_lines = []
+    is_running = True
+    loop_index = 0
+    total_frames = len(frames)
+
+    try:
+        while is_running:
+            frame_bgr, duration = frames[loop_index]
+            loop_index = (loop_index + 1) % total_frames
+
+            # Check for quit key
+            if os.name != "nt":
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    key = sys.stdin.read(1).lower()
+                    if key == "q":
+                        is_running = False
+                        break
+
+            resized = resize_image(frame_bgr, width)
+            ascii_frame = pixels_to_text(resized, mode, charset_name, color_bits)
+            current_frame_lines = ascii_frame.split("\n")
+
+            out = []
+            for i, curr_row in enumerate(current_frame_lines):
+                if i >= len(previous_frame_lines) or curr_row != previous_frame_lines[i]:
+                    out.append(f"\033[{i + 1};1H{curr_row}\033[K")
+
+            controls_str = f" GIF: {total_frames} frames | [Q] Quit "
+            controls_y_pos = len(current_frame_lines) + 2
+            out.append(
+                f"\033[{controls_y_pos};1H\033[36m{controls_str.center(width)[:width]}\033[0m\033[K"
+            )
+
+            if out:
+                data = "".join(out).encode("utf-8")
+                try:
+                    _write_queue.put_nowait((data, duration))
+                    previous_frame_lines = current_frame_lines
+                except _queue.Full:
+                    pass
+
+            time.sleep(duration)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _writer_stop.set()
+        _writer_thread.join(timeout=2.0)
+        if os.name != "nt" and old_settings:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        sys.stdout.write("\033[?25h\033[0m\n\n")
+        sys.stdout.flush()
+
+
+def play_video(filepath, width, mode, charset_name, transcript=None, color_bits=5):
     """Plays interactive ASCII video synchronized with Audio and Scrubbing on Pause."""
     set_loglevel("quiet")
 
@@ -358,6 +958,52 @@ def play_video(filepath, width, mode, charset_name, transcript=None):
     total_duration = total_frames / fps if fps > 0 and total_frames > 0 else 0
 
     audio_player = MediaPlayer(filepath, ff_opts={"vn": True, "sn": True})
+
+    # Writer thread: does blocking I/O without stalling the render loop.
+    # The render loop puts encoded frames into the queue and immediately
+    # continues. The writer drains the queue at whatever speed the terminal
+    # can accept. If the queue is already full the render loop drops the frame
+    # (keeps previous_frame_lines so the next diff is correct).
+    _write_queue = _queue.Queue(maxsize=1)
+    _writer_stop = threading.Event()
+
+    def _writer():
+        # PTY kernel buffer on macOS is typically 4096 bytes. os.write() on a
+        # blocking fd will block until ALL bytes fit — for a 9 KB frame that means
+        # 2-3 kernel round-trips each waiting for the terminal emulator to read.
+        # Fix: chunk the frame into ≤4096-byte pieces and gate each chunk with
+        # select(timeout=one_frame). If the terminal is congested we drop the
+        # remainder of the current frame instead of blocking the writer thread.
+        CHUNK = 4096
+        one_frame = 1.0 / 25  # generous timeout; updated below from actual fps
+        while True:
+            try:
+                item = _write_queue.get(timeout=0.05)
+            except _queue.Empty:
+                if _writer_stop.is_set():
+                    break
+                continue
+            if isinstance(item, tuple):
+                data, one_frame = item
+            else:
+                data = item
+            offset = 0
+            while offset < len(data):
+                chunk = data[offset: offset + CHUNK]
+                try:
+                    _, writable, _ = select.select([], [1], [], one_frame)
+                except (OSError, ValueError):
+                    return
+                if not writable:
+                    break  # terminal congested — drop rest of frame
+                try:
+                    written = os.write(1, chunk)
+                    offset += written
+                except OSError:
+                    return
+
+    _writer_thread = threading.Thread(target=_writer, daemon=True)
+    _writer_thread.start()
 
     os.system("cls" if os.name == "nt" else "clear")
     sys.stdout.write("\033[?25l")
@@ -410,6 +1056,7 @@ def play_video(filepath, width, mode, charset_name, transcript=None):
                             - current_pause_duration
                         )
                         audio_player.seek(elapsed_time, relative=False)
+                        previous_frame_lines = []  # Force full redraw after jump
                         force_render = True
 
                     elif key == "j":  # Backward 5s
@@ -432,6 +1079,7 @@ def play_video(filepath, width, mode, charset_name, transcript=None):
                             - current_pause_duration
                         )
                         audio_player.seek(elapsed_time, relative=False)
+                        previous_frame_lines = []  # Force full redraw after jump
                         force_render = True
 
             # --- PAUSE LOGIC ---
@@ -470,12 +1118,13 @@ def play_video(filepath, width, mode, charset_name, transcript=None):
 
                         status_bar = f" ⏸  {format_time(elapsed_time)} / {dur_str} {progress_bar} "
                         status_y_pos = len(previous_frame_lines) + 4
-                        sys.stdout.write(
+                        pause_data = (
                             f"\033[{status_y_pos};1H\033[47;30m{status_bar.center(width)[:width]}\033[0m\033[K"
-                        )
-                        sys.stdout.flush()
-
-                    time.sleep(0.1)
+                        ).encode("utf-8")
+                        try:
+                            _write_queue.put_nowait(pause_data)
+                        except _queue.Full:
+                            pass
                     continue
             else:
                 if pause_start_time != 0:
@@ -503,25 +1152,32 @@ def play_video(filepath, width, mode, charset_name, transcript=None):
                     time.sleep(0.001)
                     continue
 
+                # Skip frames without decoding when we're behind (cap.grab is much
+                # cheaper than cap.read since it avoids full frame decompression)
+                frames_to_skip = expected_frame_idx - current_frame_idx - 1
+                if frames_to_skip > 0:
+                    for _ in range(frames_to_skip):
+                        if not cap.grab():
+                            playback["is_running"] = False
+                            break
+                    if not playback["is_running"]:
+                        break
+
             ret, frame = cap.read()
             if not ret:
                 break
 
-            if not force_render:
-                if current_frame_idx < expected_frame_idx - 1:
-                    continue
-
             resized = resize_image(frame, width)
-            ascii_frame = pixels_to_text(resized, mode, charset_name)
+            ascii_frame = pixels_to_text(resized, mode, charset_name, color_bits)
             current_frame_lines = ascii_frame.split("\n")
 
-            output = ""
+            out = []
             for i, curr_row in enumerate(current_frame_lines):
                 if (
                     i >= len(previous_frame_lines)
                     or curr_row != previous_frame_lines[i]
                 ):
-                    output += f"\033[{i + 1};1H{curr_row}\033[K"
+                    out.append(f"\033[{i + 1};1H{curr_row}\033[K")
 
             if transcript:
                 current_subtitle = ""
@@ -538,7 +1194,7 @@ def play_video(filepath, width, mode, charset_name, transcript=None):
 
                 sub_y_pos = len(current_frame_lines) + 2
                 formatted_sub = current_subtitle.center(width)
-                output += (
+                out.append(
                     f"\033[{sub_y_pos};1H\033[93m\033[1m{formatted_sub}\033[0m\033[K"
                 )
 
@@ -558,7 +1214,7 @@ def play_video(filepath, width, mode, charset_name, transcript=None):
             status_bar = f" {state_icon}  {format_time(elapsed_time)} / {dur_str} {progress_bar} "
             status_y_pos = len(current_frame_lines) + 4
             formatted_status = status_bar.center(width)[:width]
-            output += (
+            out.append(
                 f"\033[{status_y_pos};1H\033[47;30m{formatted_status}\033[0m\033[K"
             )
 
@@ -567,18 +1223,24 @@ def play_video(filepath, width, mode, charset_name, transcript=None):
             )
             controls_y_pos = status_y_pos + 1
             formatted_controls = controls_str.center(width)[:width]
-            output += (
+            out.append(
                 f"\033[{controls_y_pos};1H\033[36m{formatted_controls}\033[0m\033[K"
             )
 
-            if output:
-                os.write(1, output.encode("utf-8"))
-
-            previous_frame_lines = current_frame_lines
+            if out:
+                data = "".join(out).encode("utf-8")
+                try:
+                    _write_queue.put_nowait((data, 1.0 / fps))
+                    previous_frame_lines = current_frame_lines
+                except _queue.Full:
+                    pass  # Writer busy: drop frame, keep baseline for correct next diff
 
     except KeyboardInterrupt:
         pass
     finally:
+        _writer_stop.set()
+        _writer_thread.join(timeout=2.0)
+
         if os.name != "nt" and old_settings:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
@@ -592,57 +1254,101 @@ def play_video(filepath, width, mode, charset_name, transcript=None):
 def main():
     args = setup_args()
 
+    # --- Utility commands (no filepath required) ---
+    if args.list_charsets:
+        cmd_list_charsets()
+        return
+
+    if args.wizard:
+        cmd_wizard()
+        return
+
+    # --- Resolve charset: built-in name or inline custom string ---
+    if args.charset in CHARSETS:
+        charset_name = args.charset
+    else:
+        custom = args.charset
+        if len(custom) < 2:
+            print("Error: custom charset must have at least 2 characters.", file=sys.stderr)
+            sys.exit(1)
+        if len(custom) > 256:
+            print("Error: custom charset must not exceed 256 characters.", file=sys.stderr)
+            sys.exit(1)
+        CHARSETS["_custom"] = custom
+        charset_name = "_custom"
+
+    # --- Resolve default width from terminal size ---
+    color_bits = args.colors
+    if args.width is not None:
+        width = args.width
+    else:
+        try:
+            width = max(40, int(shutil.get_terminal_size(fallback=(100, 24)).columns * 0.8))
+        except Exception:
+            width = 80
+
+    # --- Require filepath for all playback/export operations ---
+    if not args.filepath:
+        print("Error: a FILE or URL is required unless using --list-charsets or --wizard.", file=sys.stderr)
+        print("Run  movie-ascii --help  for usage.", file=sys.stderr)
+        sys.exit(1)
+
     try:
-        # Detect if it's a video or an image for the gallery
         if args.grid:
-            # If it's the gallery, read the file with VideoCapture to extract only Frame 0
             cap = cv2.VideoCapture(args.filepath)
             ret, frame = cap.read()
             cap.release()
-
             if not ret:
-                print(
-                    f"Error: Could not read file '{args.filepath}' for the gallery."
-                )
+                print(f"Error: Could not read file '{args.filepath}' for the grid.", file=sys.stderr)
                 sys.exit(1)
-
-            # Save that first frame temporarily for generate_html_grid to read
             temp_path = "temp_grid_frame.png"
             cv2.imwrite(temp_path, frame)
-
-            # Call your function intact
-            generate_html_grid(temp_path, args.width)
-
-            # Delete the temporary file
+            generate_html_grid(temp_path, width)
             if os.path.exists(temp_path):
                 os.remove(temp_path)
             return
 
-        # If NO --grid flag, play the video in the terminal
         video_source = args.filepath
-        transcript = None  # Default: no subtitles
+        transcript = None
 
-        # If we detect it's an internet link...
+        # GIF: use Pillow-based player
+        if video_source.lower().endswith(".gif"):
+            if args.save:
+                gif = _PILImage.open(video_source)
+                gif_frames_export = []
+                n_frames = getattr(gif, "n_frames", 1)
+                for i in range(n_frames):
+                    gif.seek(i)
+                    dur = gif.info.get("duration", 100) / 1000.0
+                    bgr = cv2.cvtColor(np.array(gif.convert("RGB")), cv2.COLOR_RGB2BGR)
+                    gif_frames_export.append((bgr, dur))
+                export_to_file(
+                    video_source, width, args.mode, charset_name,
+                    args.save, gif_frames=gif_frames_export, color_bits=color_bits,
+                )
+            else:
+                play_gif(video_source, width, args.mode, charset_name, color_bits=color_bits)
+            return
+
+        # YouTube / streaming URL
         if video_source.startswith("http://") or video_source.startswith("https://"):
             print("Web link detected. Starting streaming protocol...")
-
-            # 1. Try to catch subtitles first!
             video_id = get_youtube_id(video_source)
             transcript = get_subtitles(video_id, target_lang=args.lang)
-
             video_source = get_youtube_stream_url(video_source)
-
             if not video_source:
-                print("Could not get stream. Aborting.")
+                print("Could not get stream. Aborting.", file=sys.stderr)
                 sys.exit(1)
 
-        # Pass the local file OR YouTube stream to our engine
-        play_video(
-            video_source, args.width, args.mode, args.charset, transcript=transcript
-        )
+        if args.save:
+            export_to_file(video_source, width, args.mode, charset_name, args.save, color_bits=color_bits)
+            return
+
+        play_video(video_source, width, args.mode, charset_name, transcript=transcript, color_bits=color_bits)
 
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"An error occurred: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

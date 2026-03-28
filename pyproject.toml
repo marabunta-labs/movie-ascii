@@ -1,7 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "movie-ascii"
 version = "0.1.0"
-dependencies = ["opencv-python", "yt-dlp", "youtube-transcript-api", "ffpyplayer"]
+description = "Play videos, GIFs and images as ASCII art directly in your terminal."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "Marabunta Labs" }]
+keywords = ["ascii", "art", "terminal", "video", "gif", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video :: Display",
+    "Topic :: Terminals",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+    "yt-dlp>=2024.1.1",
+    "youtube-transcript-api>=0.6",
+    "ffpyplayer>=4.3",
+    "Pillow>=10.0",
+    "imageio-ffmpeg>=0.4.9",
+]
+
+[project.urls]
+Homepage = "https://github.com/marabunta-labs/movie-ascii"
+"Bug Tracker" = "https://github.com/marabunta-labs/movie-ascii/issues"
 
 [project.scripts]
 movie-ascii = "movie_ascii.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

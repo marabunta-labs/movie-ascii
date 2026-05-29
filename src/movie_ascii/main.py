@@ -59,15 +59,16 @@ CHARSETS = {
     "blocks": " ░▒▓█"
 }
 
-# Pre-computed lookup table for ascii-color mode (avoids per-pixel f-string in hot path)
-_ANSI_COLOR_TABLES = {
-    charset_name: {
-        (ai, ci): f"\033[{30 + ai}m{ch}\033[0m"
-        for ai in range(8)
-        for ci, ch in enumerate(chars)
-    }
-    for charset_name, chars in CHARSETS.items()
-}
+# HTML-escape translation table — used by pixels_to_html (module-level to avoid
+# rebuilding the table on every call)
+_HTML_ESCAPE = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;", " ": "&nbsp;"})
+
+# ANSI 3-bit colour palette (ascii-color mode) shared by both the terminal
+# renderer and the PIL-based exporter — defined once at module level.
+_ANSI_PAL = np.array([
+    (85, 85, 85), (255, 85, 85), (85, 255, 85), (255, 255, 85),
+    (85, 85, 255), (255, 85, 255), (85, 255, 255), (255, 255, 255),
+], dtype=np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +116,6 @@ def _init_ascii_renderer(charset_name):
 
 def _render_frame_to_pil(resized_bgr, mode, charset_name, glyph_atlas, cw, ch, color_bits=5):
     """Vectorized BGR frame → PIL Image for file export."""
-    _ANSI_PAL = np.array([
-        (85, 85, 85), (255, 85, 85), (85, 255, 85), (255, 255, 85),
-        (85, 85, 255), (255, 85, 255), (85, 255, 255), (255, 255, 255),
-    ], dtype=np.uint8)
     quant_mask = 0xFF & ~((1 << (8 - color_bits)) - 1)
     image_rgb = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
     chars = CHARSETS[charset_name]
@@ -289,54 +286,61 @@ def export_to_file(source_path, width, mode, charset_name, output_path, gif_fram
         # Write silent video to a temp file first so we can mux audio after
         tmp_fd, tmp_silent = tempfile.mkstemp(suffix="_silent.mp4")
         os.close(tmp_fd)
-        vw = None
-        for i, bgr in enumerate(_next_frame()):
-            pil_frame = _render_frame_to_pil(resize_image(bgr, width), mode, charset_name, atlas, cw, ch, color_bits)
-            if vw is None:
-                out_w, out_h = pil_frame.size
-                vw = cv2.VideoWriter(
-                    tmp_silent, cv2.VideoWriter_fourcc(*"mp4v"), fps_out, (out_w, out_h)
-                )
-            vw.write(cv2.cvtColor(np.array(pil_frame), cv2.COLOR_RGB2BGR))
-            if (i + 1) % 50 == 0:
-                print(f"  {i + 1}/{total if total > 0 else '?'} frames...", end="\r", flush=True)
-        if cap:
-            cap.release()
-        if vw:
-            vw.release()
-        print()
-        # Try to mux the original audio track using the bundled ffmpeg binary
-        audio_added = False
-        if gif_frames is None and not _is_image and source_path:
+        try:
+            vw = None
+            for i, bgr in enumerate(_next_frame()):
+                pil_frame = _render_frame_to_pil(resize_image(bgr, width), mode, charset_name, atlas, cw, ch, color_bits)
+                if vw is None:
+                    out_w, out_h = pil_frame.size
+                    vw = cv2.VideoWriter(
+                        tmp_silent, cv2.VideoWriter_fourcc(*"mp4v"), fps_out, (out_w, out_h)
+                    )
+                vw.write(cv2.cvtColor(np.array(pil_frame), cv2.COLOR_RGB2BGR))
+                if (i + 1) % 50 == 0:
+                    print(f"  {i + 1}/{total if total > 0 else '?'} frames...", end="\r", flush=True)
+            if cap:
+                cap.release()
+            if vw:
+                vw.release()
+            print()
+            # Try to mux the original audio track using the bundled ffmpeg binary
+            audio_added = False
+            if gif_frames is None and not _is_image and source_path:
+                try:
+                    subprocess.run(
+                        [
+                            _FFMPEG_EXE, "-y",
+                            "-i", tmp_silent,
+                            "-i", source_path,
+                            "-c:v", "copy",
+                            "-c:a", "aac", "-b:a", "192k",
+                            "-map", "0:v:0", "-map", "1:a:0",
+                            "-shortest",
+                            output_path,
+                        ],
+                        check=True,
+                        capture_output=True,
+                        timeout=600,
+                    )
+                    audio_added = True
+                    print("Audio track added.")
+                except FileNotFoundError:
+                    print("ffmpeg binary not found — saving without audio.")
+                except subprocess.CalledProcessError:
+                    print("Could not add audio (source may have no audio track) — saving without audio.")
+                except subprocess.TimeoutExpired:
+                    print("ffmpeg timed out — saving without audio.")
+            if audio_added:
+                os.remove(tmp_silent)
+            else:
+                os.replace(tmp_silent, output_path)
+            print(f"Saved: {output_path}")
+        except Exception:
             try:
-                subprocess.run(
-                    [
-                        _FFMPEG_EXE, "-y",
-                        "-i", tmp_silent,
-                        "-i", source_path,
-                        "-c:v", "copy",
-                        "-c:a", "aac", "-b:a", "192k",
-                        "-map", "0:v:0", "-map", "1:a:0",
-                        "-shortest",
-                        output_path,
-                    ],
-                    check=True,
-                    capture_output=True,
-                    timeout=600,
-                )
-                audio_added = True
-                print("Audio track added.")
-            except FileNotFoundError:
-                print("ffmpeg binary not found — saving without audio.")
-            except subprocess.CalledProcessError:
-                print("Could not add audio (source may have no audio track) — saving without audio.")
-            except subprocess.TimeoutExpired:
-                print("ffmpeg timed out — saving without audio.")
-        if audio_added:
-            os.remove(tmp_silent)
-        else:
-            os.replace(tmp_silent, output_path)
-        print(f"Saved: {output_path}")
+                os.remove(tmp_silent)
+            except OSError:
+                pass
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -514,8 +518,10 @@ def setup_args():
 
 def resize_image(image, new_width=100):
     height, width = image.shape[:2]
+    if width == 0 or height == 0:
+        return image
     aspect_ratio = height / width
-    new_height = int(new_width * aspect_ratio * 0.5)
+    new_height = max(1, int(new_width * aspect_ratio * 0.5))
     return cv2.resize(image, (new_width, new_height))
 
 
@@ -598,11 +604,11 @@ def pixels_to_text(image, mode, charset_name, color_bits=5):
 
 def pixels_to_html(image, mode, charset_name):
     """Generates HTML code for the comparative grid."""
-    html_str = ""
+    parts = []
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     chars = CHARSETS[charset_name]
+    n_chars = len(chars)
 
-    # Basic ANSI colors simulated in HEX for ascii-color mode
     ansi_colors = [
         "#555555",
         "#FF5555",
@@ -616,36 +622,26 @@ def pixels_to_html(image, mode, charset_name):
 
     for row in image_rgb:
         for pixel in row:
-            r, g, b = pixel
-            if mode in ["bw", "ascii-color", "truecolor"]:
-                luminance = int(0.299 * r + 0.587 * g + 0.114 * b)
-                char_index = int(luminance / 255 * (len(chars) - 1))
-                char = chars[char_index]
-                char = (
-                    char.replace("&", "&amp;")
-                    .replace("<", "&lt;")
-                    .replace(">", "&gt;")
-                    .replace(" ", "&nbsp;")
-                )
+            r, g, b = int(pixel[0]), int(pixel[1]), int(pixel[2])
+            luminance = int(0.299 * r + 0.587 * g + 0.114 * b)
+            char_index = min(int(luminance / 255 * (n_chars - 1)), n_chars - 1)
+            char = chars[char_index].translate(_HTML_ESCAPE)
 
-                if mode == "bw":
-                    html_str += char
-                elif mode == "ascii-color":
-                    ansi_index = (
-                        (1 if r > 127 else 0)
-                        + (2 if g > 127 else 0)
-                        + (4 if b > 127 else 0)
-                    )
-                    html_str += (
-                        f'<span style="color: {ansi_colors[ansi_index]};">{char}</span>'
-                    )
-                elif mode == "truecolor":
-                    # Render in HTML with the exact RGB color
-                    html_str += f'<span style="color: rgb({r},{g},{b});">{char}</span>'
-            elif mode == "block":
-                html_str += f'<span style="color: rgb({r},{g},{b});">&#9608;</span>'  # &#9608; is █ in HTML
-        html_str += "<br>"
-    return html_str
+            if mode == "bw":
+                parts.append(char)
+            elif mode == "ascii-color":
+                ansi_index = (
+                    (1 if r > 127 else 0)
+                    + (2 if g > 127 else 0)
+                    + (4 if b > 127 else 0)
+                )
+                parts.append(
+                    f'<span style="color:{ansi_colors[ansi_index]}">{char}</span>'
+                )
+            else:  # truecolor
+                parts.append(f'<span style="color:rgb({r},{g},{b})">{char}</span>')
+        parts.append("<br>")
+    return "".join(parts)
 
 
 def generate_html_grid(image_path, original_width):
@@ -682,32 +678,26 @@ def generate_html_grid(image_path, original_width):
     </style>
     """
 
-    html = f'<html><head><meta charset="UTF-8">{css}</head><body>'
-    html += f"<h1>Rendering Comparison (Width: {grid_width})</h1>"
-
-    # --- 0. ORIGINAL IMAGE ---
-    html += "<h2>0. Original Image</h2>"
-    html += f'<div class="original-container">{original_img_html}</div>'
-
-    # --- 1. MAIN TABLE ---
-    html += "<h2>1. Alphabet-based Modes</h2>"
-    html += "<table><tr><th>Alphabet \\ Mode</th><th>BLACK AND WHITE (bw)</th><th>ASCII COLOR (ascii-color)</th><th>TRUECOLOR (truecolor)</th></tr>"
+    html_parts = [
+        f'<html><head><meta charset="UTF-8">{css}</head><body>',
+        f"<h1>Rendering Comparison (Width: {grid_width})</h1>",
+        "<h2>0. Original Image</h2>",
+        f'<div class="original-container">{original_img_html}</div>',
+        "<h2>1. Alphabet-based Modes</h2>",
+        "<table><tr><th>Alphabet \\ Mode</th><th>BLACK AND WHITE (bw)</th><th>ASCII COLOR (ascii-color)</th><th>TRUECOLOR (truecolor)</th></tr>",
+    ]
 
     for c in CHARSETS.keys():
-        html += f"<tr><th>{c.upper()}</th>"
-        html_bw = pixels_to_html(image_resized, "bw", c)
-        html += f'<td><div class="preview-box">{html_bw}</div></td>'
-        html_color = pixels_to_html(image_resized, "ascii-color", c)
-        html += f'<td><div class="preview-box">{html_color}</div></td>'
-        html_truecolor = pixels_to_html(image_resized, "truecolor", c)
-        html += f'<td><div class="preview-box">{html_truecolor}</div></td>'
-        html += "</tr>"
+        html_parts.append(f"<tr><th>{c.upper()}</th>")
+        html_parts.append(f'<td><div class="preview-box">{pixels_to_html(image_resized, "bw", c)}</div></td>')
+        html_parts.append(f'<td><div class="preview-box">{pixels_to_html(image_resized, "ascii-color", c)}</div></td>')
+        html_parts.append(f'<td><div class="preview-box">{pixels_to_html(image_resized, "truecolor", c)}</div></td>')
+        html_parts.append("</tr>")
 
-    html += "</table>"
+    html_parts.extend(["</table>", "</body></html>"])
+    html = "".join(html_parts)
 
-    html += "</body></html>"
-
-    file_path = os.path.abspath("preview.html")
+    file_path = os.path.join(tempfile.gettempdir(), "movie_ascii_preview.html")
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(html)
 
@@ -718,9 +708,16 @@ def generate_html_grid(image_path, original_width):
 def get_youtube_id(url):
     """Extracts the exact video ID from any type of YouTube URL."""
     parsed_url = urlparse(url)
-    if parsed_url.hostname in ("youtu.be", "www.youtu.be"):
-        return parsed_url.path[1:]
-    if parsed_url.hostname in ("youtube.com", "www.youtube.com"):
+    hostname = parsed_url.hostname or ""
+    if hostname in ("youtu.be", "www.youtu.be"):
+        video_id = parsed_url.path.lstrip("/").split("/")[0]
+        return video_id if video_id else None
+    if hostname in (
+        "youtube.com", "www.youtube.com",
+        "m.youtube.com", "music.youtube.com",
+    ):
+        if parsed_url.path.startswith("/shorts/"):
+            return parsed_url.path.split("/")[2] or None
         return parse_qs(parsed_url.query).get("v", [None])[0]
     return None
 
@@ -746,7 +743,7 @@ def get_subtitles(video_id, target_lang="es"):
             print(f"  -> Success! Subtitles found in: {transcript.language}")
             return transcript.fetch()
 
-        except:
+        except Exception:
             # 2. If it fails, extract all available language codes
             available_langs = [t.language_code for t in transcript_list]
 
@@ -816,12 +813,19 @@ def get_youtube_stream_url(youtube_url):
 def format_time(seconds):
     if seconds < 0:
         return "00:00"
-    mins, secs = divmod(int(seconds), 60)
+    total_secs = int(seconds)
+    hours, remainder = divmod(total_secs, 3600)
+    mins, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}:{mins:02d}:{secs:02d}"
     return f"{mins:02d}:{secs:02d}"
 
 
 def play_gif(filepath, width, mode, charset_name, color_bits=5):
     """Plays an animated GIF as ASCII art in the terminal."""
+    if not _PIL_AVAILABLE:
+        print("Error: Pillow is required for GIF playback. Run: pip install pillow")
+        return
     try:
         gif = _PILImage.open(filepath)
     except Exception as e:
@@ -951,7 +955,7 @@ def play_video(filepath, width, mode, charset_name, transcript=None, color_bits=
         return
 
     fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps == 0 or fps != fps:
+    if fps <= 0 or fps != fps or fps > 240:
         fps = 24.0
 
     total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
@@ -1181,14 +1185,18 @@ def play_video(filepath, width, mode, charset_name, transcript=None, color_bits=
 
             if transcript:
                 current_subtitle = ""
-                for sub in transcript:
+                lo, hi = 0, len(transcript) - 1
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    sub = transcript[mid]
                     sub_start = sub["start"] if isinstance(sub, dict) else sub.start
-                    sub_duration = (
-                        sub["duration"] if isinstance(sub, dict) else sub.duration
-                    )
-                    sub_text = sub["text"] if isinstance(sub, dict) else sub.text
-
-                    if sub_start <= elapsed_time <= (sub_start + sub_duration):
+                    sub_duration = sub["duration"] if isinstance(sub, dict) else sub.duration
+                    if sub_start + sub_duration < elapsed_time:
+                        lo = mid + 1
+                    elif sub_start > elapsed_time:
+                        hi = mid - 1
+                    else:
+                        sub_text = sub["text"] if isinstance(sub, dict) else sub.text
                         current_subtitle = sub_text.replace("\n", " ")
                         break
 
@@ -1280,7 +1288,7 @@ def main():
     # --- Resolve default width from terminal size ---
     color_bits = args.colors
     if args.width is not None:
-        width = args.width
+        width = max(10, args.width)
     else:
         try:
             width = max(40, int(shutil.get_terminal_size(fallback=(100, 24)).columns * 0.8))
@@ -1301,11 +1309,14 @@ def main():
             if not ret:
                 print(f"Error: Could not read file '{args.filepath}' for the grid.", file=sys.stderr)
                 sys.exit(1)
-            temp_path = "temp_grid_frame.png"
-            cv2.imwrite(temp_path, frame)
-            generate_html_grid(temp_path, width)
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            tmp_fd, temp_path = tempfile.mkstemp(suffix=".png")
+            os.close(tmp_fd)
+            try:
+                cv2.imwrite(temp_path, frame)
+                generate_html_grid(temp_path, width)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
             return
 
         video_source = args.filepath
@@ -1314,6 +1325,9 @@ def main():
         # GIF: use Pillow-based player
         if video_source.lower().endswith(".gif"):
             if args.save:
+                if not _PIL_AVAILABLE:
+                    print("Error: Pillow is required for GIF export. Run: pip install pillow", file=sys.stderr)
+                    sys.exit(1)
                 gif = _PILImage.open(video_source)
                 gif_frames_export = []
                 n_frames = getattr(gif, "n_frames", 1)
@@ -1334,7 +1348,8 @@ def main():
         if video_source.startswith("http://") or video_source.startswith("https://"):
             print("Web link detected. Starting streaming protocol...")
             video_id = get_youtube_id(video_source)
-            transcript = get_subtitles(video_id, target_lang=args.lang)
+            if not args.save:
+                transcript = get_subtitles(video_id, target_lang=args.lang)
             video_source = get_youtube_stream_url(video_source)
             if not video_source:
                 print("Could not get stream. Aborting.", file=sys.stderr)
